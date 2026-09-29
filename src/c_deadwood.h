@@ -19,789 +19,434 @@
 
 
 #include "c_common.h"
-#include "c_kneedle.h"
-#include <stdexcept>
+#include "c_mst_helpers.h"
+#include <memory>
 
 
-/** because std::vector<bool> has no data().... */
-template <class T>
-class cvector {
-private:
-    T* x;
-    size_t n;
-
-public:
-    cvector(size_t n) : x(nullptr), n(n) {
-        DEADWOOD_ASSERT(n>0);
-        x = new T[n];
-        DEADWOOD_ASSERT(x);
-    }
-
-    cvector(size_t n, T v) : x(nullptr), n(n) {
-        DEADWOOD_ASSERT(n>0);
-        x = new T[n];
-        DEADWOOD_ASSERT(x);
-        for (size_t i=0; i<n; ++i)
-            x[i] = v;
-    }
-
-    ~cvector() {
-        if (x) delete [] x;
-        x = nullptr;
-        n = 0;
-    }
-
-    inline T* data() { return x; }
-    inline size_t size() const { return n; }
-    inline T operator[](int i) const { return x[i]; }
-    inline T& operator[](int i) { return x[i]; }
-};
-
-
-/*! Reorders x w.r.t. a factor c
- *
- * y[ind[j]],...,y[ind[j+1]-1] give all x[i]s, in their original relative order,
- * for which c[i]==j.
- *
- * Elements corresponding to c[i] < 0 are put at the start of y.
- * c[i] >= k is disallowed.
- *
- * @param x [in] array of size n
- * @param n
- * @param c [in] array of size n with elements in {...,0,1,..,k-1}
- * @param k
- * @param y [out] array of size n
- * @param ind [out] array of size k+1
- */
 template <class FLOAT>
-void Csort_groups(
-    const FLOAT* x, Py_ssize_t n, const Py_ssize_t* c, Py_ssize_t k,
-    FLOAT* y, Py_ssize_t* ind
-) {
-    for (Py_ssize_t j=0; j<=k; ++j) ind[j] = 0;
-
-    for (Py_ssize_t i=0; i<n; ++i) {
-        DEADWOOD_ASSERT(c[i] < k);
-        if (c[i] < 0)
-            ++ind[0];
-        else if (c[i] < k)
-            ++ind[c[i]+1];
-    }
-
-    Py_ssize_t u = ind[0];
-    ind[0] = 0;
-    for (Py_ssize_t j=1; j<=k; ++j) {
-        Py_ssize_t v = ind[j];
-        ind[j] = u;  // sum of the original ind[0]..ind[j-1]
-        u += v;
-    }
-
-    for (Py_ssize_t i=0; i<n; ++i) {
-        if (c[i] < 0)
-            y[ind[0]++] = x[i];
-        else
-            y[ind[c[i]+1]++] = x[i];
-    }
-}
-
-
-/*! Identifies which MST edges must be skipped to obtain a forest whose
- *  connected components match a given partition.  If this is not possible,
- *  a more fine-grained split is generated.
- *
- *  This is as easy as finding all MST edges {u,v} for which c[u]≠c[v].
- *
- *  @param mst_i c_contiguous matrix of size m*2,
- *     where {mst_i[k,0], mst_i[k,1]} specifies the k-th (undirected) edge
- *     in the spanning tree
- *  @param m number of rows in mst_i (edges)
- *  @param n length of c and the number of vertices in the spanning tree
- *  @param c [in] array of length n, where
- *      c[i] denotes the cluster ID of the i-th object
- *  @param skip [out] array of length m, indicating which edges
- *      of the tree must be skipped to create a subpartition of c
- *
- *  @return s number of edges in skip;  ideally, s=k-1, where k is the
- *      number of classes in c
- */
-Py_ssize_t Cget_skip_edges(
-    const Py_ssize_t* mst_i,  // size m [in]
-    Py_ssize_t m,
-    const Py_ssize_t* c,  // size n [in]
-    Py_ssize_t n,
-    bool* skip  // size m [out]
-) {
-    Py_ssize_t s = 0;
-
-    for (Py_ssize_t i=0; i<m; ++i) {
-        Py_ssize_t u = mst_i[2*i+0];
-        Py_ssize_t v = mst_i[2*i+1];
-        DEADWOOD_ASSERT(u >= 0 && u < n);
-        DEADWOOD_ASSERT(v >= 0 && v < n);
-        if (c[u] != c[v]) {
-            s++;
-            skip[i] = true;
-        }
-        else
-            skip[i] = false;
-    }
-
-    return s;
-}
-
-/*! Decode indexes based on a skip array.
- *
- * If `skip=[False, True, False, False, True, False, False]`,
- * then the indexes in `ind` are mapped in such a way that:
- * 0 → 0,
- * 1 → 2,
- * 2 → 3,
- * 3 → 5,
- * 4 → 6.
- *
- * This function might be useful if we apply a method on `X[~skip,:]`
- * (a subset of rows in `X`), obtain a vector of indexes `ind` relative to
- * the indexes of rows in `X[~skip,:]` as a result, and wish to translate `ind`
- * back to the original row space of `X[:,:]`.
- *
- * For instance, `unskip_indexes([0, 2, 1], [True, False, True, False, False])`
- * yields `[1, 4, 3]`.
- *
- * @param ind [in/out] array of m indexes in 0..k-1 to translate
- * @param m size of ind
- * @param skip Boolean array of size n with k elements equal to False
- * @param n size of skip
- */
-void Cunskip_indexes(
-    Py_ssize_t* ind, Py_ssize_t m,
-    const bool* skip, Py_ssize_t n
-) {
-    if (m <= 0) return;
-    DEADWOOD_ASSERT(n > 0);
-
-    cvector<Py_ssize_t> o(n);  // actually, k needed
-    Py_ssize_t k = 0;
-    for (Py_ssize_t i=0; i<n; ++i) {
-        if (!skip[i]) o[k++] = i;
-    }
-
-    for (Py_ssize_t i=0; i<m; ++i) {
-        DEADWOOD_ASSERT(ind[i] >= 0 && ind[i] < k)
-        ind[i] = o[ind[i]];
-    }
-
-    // std::vector<Py_ssize_t> o(m);
-    // Cargsort(o.data(), ind, m, false);
-    //
-    // Py_ssize_t j = 0;
-    // Py_ssize_t k = 0;
-    // for (Py_ssize_t i=0; i<n; ++i) {
-    //     if (skip[i]) continue;
-    //
-    //     if (ind[o[k]] == j) {
-    //         ind[o[k]] = i;
-    //         k++;
-    //
-    //         if (k == m) return;
-    //     }
-    //
-    //     j++;
-    // }
-    //
-    // throw std::domain_error("index to translate out of range");
-}
-
-
-/*! Encode indexes based on a skip array.
- *
- * If `skip=[False, True, False, False, True, False, False]`,
- * then the indexes in `ind` are mapped in such a way that:
- * 0 ← 0,
- * 1 ← 2,
- * 2 ← 3,
- * 3 ← 5,
- * 4 ← 6,
- * i.e., the indexes for which `skip` is False are mapped
- * to consecutive integers.  All other indexes are assigned the value -1.
- *
- * For instance, `skip_indexes([1, 4, 3], [True, False, True, False, False])`
- * yields `[0, 2, 1]`.
- *
- * @param ind [in/out] array of m indexes in 0..n-1 to translate
- * @param m size of ind
- * @param skip Boolean array of size n
- * @param n size of skip
- */
-void Cskip_indexes(
-    Py_ssize_t* ind, Py_ssize_t m,
-    const bool* skip, Py_ssize_t n
-) {
-    if (m <= 0) return;
-    DEADWOOD_ASSERT(n > 0);
-
-    cvector<Py_ssize_t> o(n);
-    Py_ssize_t k = 0;
-    for (Py_ssize_t i=0; i<n; ++i) {
-        if (skip[i]) o[i] = -1;
-        else o[i] = (k++);
-    }
-
-    for (Py_ssize_t i=0; i<m; ++i) {
-        DEADWOOD_ASSERT(ind[i] >= 0 && ind[i] < n)
-        ind[i] = o[ind[i]];
-    }
-}
-
-
-/** Count the number of non-zero elements in a Boolean array x of length n
- */
-Py_ssize_t Csum_bool(const bool* x, Py_ssize_t n)
-{
-    Py_ssize_t s = 0;
-    for (Py_ssize_t i=0; i<n; ++i)
-        if (x[i]) s++;
-    return s;
-}
-
-
-/*! Compute the degree of each vertex in an undirected graph
- *  over a vertex set {0,...,n-1}.
- *
- *
- * @param ind c_contiguous matrix of size m*2,
- *     where {ind[i,0], ind[i,1]} is the i-th edge with ind[i,j] < n
- * @param m number of edges (rows in ind)
- * @param n number of vertices
- * @param deg [out] array of size n, where
- *     deg[i] will give the degree of the i-th vertex.
- */
-void Cgraph_vertex_degrees(
-    const Py_ssize_t* ind,
-    const Py_ssize_t m,
-    const Py_ssize_t n,
-    Py_ssize_t* deg /*out*/
-) {
-    for (Py_ssize_t i=0; i<n; ++i)
-        deg[i] = 0;
-
-    for (Py_ssize_t i=0; i<m; ++i) {
-        Py_ssize_t u = ind[2*i+0];
-        Py_ssize_t v = ind[2*i+1];
-
-        if (u < 0 || v < 0)
-            throw std::domain_error("All elements must be >= 0");
-        else if (u >= n || v >= n)
-            throw std::domain_error("All elements must be < n");
-        else if (u == v)
-            throw std::domain_error("Self-loops are not allowed");
-
-        deg[u]++;
-        deg[v]++;
-    }
-}
-
-
-/*! Compute the incidence list of each vertex in an undirected graph
- *  over a vertex set {0,...,n-1}.
- *
- *  @param ind c_contiguous matrix of size m*2,
- *      where {ind[i,0], ind[i,1]} is the i-th edge with ind[i,j] < n
- *  @param m number of edges (rows in ind)
- *  @param n number of vertices
- *  @param cumdeg [out] array of size n+1, where cumdeg[i+1] the sum of the first i vertex degrees
- *  @param inc [out] array of size 2*m; inc[cumdeg[i]]..inc[cumdeg[i+1]-1] gives the edges incident on the i-th vertex
- */
-void Cgraph_vertex_incidences(
-    const Py_ssize_t* ind,
-    const Py_ssize_t m,
-    const Py_ssize_t n,
-    Py_ssize_t* cumdeg,
-    Py_ssize_t* inc
-) {
-    cumdeg[0] = 0;
-    Cgraph_vertex_degrees(ind, m, n, cumdeg+1);
-
-    Py_ssize_t cd = 0;
-    for (Py_ssize_t i=1; i<n+1; ++i) {
-        Py_ssize_t this_deg = cumdeg[i];
-        cumdeg[i] = cd;
-        cd += this_deg;
-    }
-    // that's not it yet; cumdeg is adjusted below
-
-
-    for (Py_ssize_t e=0; e<m; ++e) {
-        Py_ssize_t u = ind[2*e+0];
-        Py_ssize_t v = ind[2*e+1];
-
-        *(inc+cumdeg[u+1]) = e;
-        ++(cumdeg[u+1]);
-
-        *(inc+cumdeg[v+1]) = e;
-        ++(cumdeg[v+1]);
-    }
-
-    DEADWOOD_ASSERT(cumdeg[0] == 0);
-    DEADWOOD_ASSERT(cumdeg[n] == 2*m);
-
-
-// #ifdef DEBUG
-//     cumdeg = 0;
-//     inc[0] = data;
-//     for (Py_ssize_t i=0; i<n; ++i) {
-//         DEADWOOD_ASSERT(inc[i] == data+cumdeg);
-//         cumdeg += deg[i];
-//     }
-// #endif
-}
-
-
-
-
-/* ************************************************************************** */
-
-
-class CMSTProcessorBase
-{
-protected:
-    const Py_ssize_t* mst_i;  // size m*2, elements in [0,n)
-    const Py_ssize_t m;  // preferably == n-1; number of edges in mst_i
-    const Py_ssize_t n;  // number of vertices
-
-    Py_ssize_t* c;  // nullable or length n; cluster IDs of the vertices
-
-    const Py_ssize_t* cumdeg;  // nullable or length n+1
-    const Py_ssize_t* inc;     // nullable or length 2*m
-    const bool* skip_edges;    // nullable or length m
-
-    std::vector<Py_ssize_t> _cumdeg;  // data buffer for cumdeg (optional)
-    std::vector<Py_ssize_t> _inc;     // data buffer for inc (optional)
-
-
-public:
-
-    CMSTProcessorBase(
-        const Py_ssize_t* mst_i,
-        const Py_ssize_t m,
-        const Py_ssize_t n,
-        Py_ssize_t* c=nullptr,
-        const Py_ssize_t* cumdeg=nullptr,
-        const Py_ssize_t* inc=nullptr,
-        const bool* skip_edges=nullptr
-    ) :
-        mst_i(mst_i), m(m), n(n), c(c),
-        cumdeg(cumdeg), inc(inc), skip_edges(skip_edges)
-    {
-        if (!cumdeg) {
-            DEADWOOD_ASSERT(!inc);
-            _cumdeg.resize(n+1);
-            _inc.resize(2*m);
-            Cgraph_vertex_incidences(mst_i, m, n, _cumdeg.data(), _inc.data());
-            this->cumdeg = _cumdeg.data();
-            this->inc = _inc.data();
-        }
-        else {
-            DEADWOOD_ASSERT(inc);
-        }
-    }
-};
-
-
-
-/* ************************************************************************** */
-
-
-
-/** See Cmst_get_cluster_sizes below.
- */
-class CMSTClusterSizeGetter : public CMSTProcessorBase
+class CDeadwood : public CMSTProcessorBase
 {
 private:
 
+    const FLOAT* mst_d;
+    FLOAT max_contamination;
+    FLOAT ema_dt;
+    Py_ssize_t max_debris_size;
     Py_ssize_t max_k;
-    Py_ssize_t* s;  // NULL or of size max_k >= k, where k is the number of clusters
-    Py_ssize_t k;   // the number of connected components identified
+    FLOAT min_cluster_factor;
+    // FLOAT inlier_threshold;
 
+    std::unique_ptr<bool[]> is_inlier;
 
-    Py_ssize_t visit(Py_ssize_t v, Py_ssize_t e)
+    std::unique_ptr<Py_ssize_t[]> c;  // cluster IDs of vertices [n]
+    std::unique_ptr<Py_ssize_t[]> d;  // subcluster IDs of vertices [n]
+    std::unique_ptr<Py_ssize_t[]> s;  // s[i] is the size of the i-th cluster [max_k]
+
+    std::unique_ptr<Py_ssize_t[]> mst_cutsizes;  //< size m*2, each pair gives the sizes of the clusters that are formed when we cut out the corresponding edge
+
+    std::unique_ptr<bool[]> skip_edges;  // disabling edges yields clusters [m]
+    std::unique_ptr<FLOAT[]> contamination;  // contamination levels [max_k]
+    std::unique_ptr<FLOAT[]> weight_thresholds;  // edge weight thresholds [max_k]
+
+    Py_ssize_t k;  // the number of clusters identified
+
+    Py_ssize_t cur_s;  // number of edges in the current cluster
+    std::unique_ptr<Py_ssize_t[]> cur_e;  // edges in the current cluster [m]
+    std::unique_ptr<FLOAT[]> cur_d;       // weights of edges in the current cluster [m]
+
+    Py_ssize_t cur_p;  // number of vertices in the current subcluster
+    std::unique_ptr<Py_ssize_t[]> cur_v;  // vertices in the current subcluster [n]
+
+    /* helper for mark_cluster */
+    Py_ssize_t mark_cluster_visitor(Py_ssize_t v, Py_ssize_t e)
     {
         Py_ssize_t w;
 
         if (e < 0) {
             w = v;
         }
-        else if (skip_edges && skip_edges[e])
+        else if (skip_edges[e])
             return 0;
         else {
             Py_ssize_t iv = (Py_ssize_t)(mst_i[2*e+1]==v);
             w = mst_i[2*e+(1-iv)];
+            cur_e[cur_s++] = e;
         }
 
-        DEADWOOD_ASSERT(c[w] < 0);
+        //DEADWOOD_ASSERT(c[w] < 0);
         c[w] = k;
 
         Py_ssize_t curs = 1;
 
         for (const Py_ssize_t* pe = inc+cumdeg[w]; pe != inc+cumdeg[w+1]; pe++) {
-            if (*pe != e) curs += visit(w, *pe);
+            if (*pe != e) curs += mark_cluster_visitor(w, *pe);
+        }
+
+        if (e >= 0) {
+            Py_ssize_t iv = (Py_ssize_t)(mst_i[2*e+1]==v);
+            mst_cutsizes[2*e+(1-iv)] = curs;
+            mst_cutsizes[2*e+iv] = -1;
+            //mst_cutsizes[2*e+iv] = this_component_size-curs;  // t.b.d. later
         }
 
         return curs;
     }
 
 
+    /* Let v and its neighbours be marked as members of the k-th cluster */
+    void mark_cluster(Py_ssize_t v)
+    {
+        cur_s = 0;
+        s[k] = mark_cluster_visitor(v, -1);
+        DEADWOOD_ASSERT(cur_s+1 == s[k]);
+
+        for (Py_ssize_t i=0; i<cur_s; i++) {
+            Py_ssize_t e = cur_e[i];
+            cur_d[i] = mst_d[e];
+            if (mst_cutsizes[2*e+0]>=0)
+                mst_cutsizes[2*e+1] = s[k]-mst_cutsizes[2*e+0];
+            else
+                mst_cutsizes[2*e+0] = s[k]-mst_cutsizes[2*e+1];
+        }
+        std::sort(cur_d.get(), cur_d.get()+cur_s);
+
+        Py_ssize_t elbow_index;
+        Cget_contamination(
+            cur_d.get(), cur_s, max_contamination, ema_dt,
+            contamination[k], elbow_index
+        );
+        weight_thresholds[k] = (elbow_index+1<cur_s)?cur_d[elbow_index+1]:INFINITY;
+    }
+
+
+
+    void mark_inliers_visitor(Py_ssize_t v, Py_ssize_t e)
+    {
+        Py_ssize_t w;
+
+        if (e < 0) {
+            w = v;
+        }
+        else if (skip_edges[e] || mst_d[e] >= weight_thresholds[k])
+            return;
+        else {
+            Py_ssize_t iv = (Py_ssize_t)(mst_i[2*e+1]==v);
+            w = mst_i[2*e+(1-iv)];
+        }
+
+        cur_v[cur_p++] = w;
+        d[w] = 1;
+
+        for (const Py_ssize_t* pe = inc+cumdeg[w]; pe != inc+cumdeg[w+1]; pe++) {
+            if (*pe != e) mark_inliers_visitor(w, *pe);
+        }
+    }
+
+
+
+    /* Marks inliers in a cluster consisting of edges in cur_e */
+    Py_ssize_t mark_inliers()
+    {
+        Py_ssize_t changed_inliers = 0;
+
+        for (Py_ssize_t i=0; i<cur_s; ++i) {
+            d[mst_i[2*cur_e[i]+0]] = -1;
+            d[mst_i[2*cur_e[i]+1]] = -1;
+        }
+
+        for (Py_ssize_t i=0; i<cur_s; ++i) {
+            for (Py_ssize_t j=0; j<=1; ++j) {
+                Py_ssize_t v = mst_i[2*cur_e[i]+j];
+                if (d[v]>=0) continue;
+
+                cur_p = 0;
+                mark_inliers_visitor(v, -1);
+
+                if (cur_p > max_debris_size) {
+                    for (Py_ssize_t u=0; u<cur_p; ++u) {
+                        if (!is_inlier[cur_v[u]]) {
+                            changed_inliers++;
+                            is_inlier[cur_v[u]] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return changed_inliers;
+    }
+
+
 public:
-    CMSTClusterSizeGetter(
+    CDeadwood(
+        const FLOAT* mst_d,
         const Py_ssize_t* mst_i,
         Py_ssize_t m,
         Py_ssize_t n,
-        Py_ssize_t* c,
+        FLOAT max_contamination,
+        FLOAT ema_dt,
+        Py_ssize_t max_debris_size,
+        Py_ssize_t k,
         Py_ssize_t max_k,
-        Py_ssize_t* s=nullptr,
-        const Py_ssize_t* cumdeg=nullptr,
-        const Py_ssize_t* inc=nullptr,
-        const bool* skip_edges=nullptr
-    ) : CMSTProcessorBase(mst_i, m, n, c, cumdeg, inc, skip_edges), max_k(max_k), s(s), k(-1)
+        FLOAT min_cluster_factor,
+        // FLOAT inlier_threshold,
+        const Py_ssize_t* mst_cut=nullptr,
+        const Py_ssize_t* mst_cumdeg=nullptr,
+        const Py_ssize_t* mst_inc=nullptr
+    ) : CMSTProcessorBase(mst_i, m, n, mst_cumdeg, mst_inc),
+        mst_d(mst_d), max_contamination(max_contamination),
+        ema_dt(ema_dt), max_debris_size(max_debris_size),
+        max_k(max_k), min_cluster_factor(min_cluster_factor)
+        // inlier_threshold(inlier_threshold)
     {
-        DEADWOOD_ASSERT(this->c);
         DEADWOOD_ASSERT(this->cumdeg);
         DEADWOOD_ASSERT(this->inc);
+
+        is_inlier.reset(new bool[n]);
+
+        c.reset(new Py_ssize_t[n]);
+        d.reset(new Py_ssize_t[n]);
+        s.reset(new Py_ssize_t[max_k]);
+        contamination.reset(new FLOAT[max_k]);
+        weight_thresholds.reset(new FLOAT[max_k]);
+        mst_cutsizes.reset(new Py_ssize_t[2*m]);
+        cur_e.reset(new Py_ssize_t[m]);
+        cur_d.reset(new FLOAT[m]);
+        cur_v.reset(new Py_ssize_t[n]);
+
+        skip_edges.reset(new bool[m]);
+        for (Py_ssize_t e=0; e<m; ++e) skip_edges[e] = false;
+        if (mst_cut && k > 1) {
+            for (Py_ssize_t i=0; i<k-1; ++i) {
+                DEADWOOD_ASSERT(mst_cut[i] >= 0 && mst_cut[i] < m);
+                DEADWOOD_ASSERT(!skip_edges[mst_cut[i]]);
+                skip_edges[mst_cut[i]] = true;
+            }
+        }
     }
 
 
     Py_ssize_t process()
     {
         for (Py_ssize_t v=0; v<n; ++v) c[v] = -1;
+        for (Py_ssize_t v=0; v<n; ++v) is_inlier[v] = false;
         for (Py_ssize_t i=0; i<max_k; ++i) s[i] = 0;
+        for (Py_ssize_t i=0; i<2*m; ++i) mst_cutsizes[i] = -1;
 
+        // start with the initial partition (possibly the whole set)
         k = 0;
         for (Py_ssize_t v=0; v<n; ++v) {
             if (c[v] >= 0) continue;  // already visited -> skip
-
-            if (s) {
-                DEADWOOD_ASSERT(k<max_k);
-                s[k] = visit(v, -1);
-            }
-            else
-                visit(v, -1);
-
+            DEADWOOD_ASSERT(k<max_k);
+            mark_cluster(v);
+            mark_inliers();
             k++;
+        }
+
+        // DEADWOOD_PRINT("%d %d\n", k, max_k);
+        if (k == max_k) return k;
+
+        Py_ssize_t num_left=0;
+        std::unique_ptr<bool[]> left(new bool[max_k]);
+        for (; num_left<k; num_left++) left[num_left] = true;
+
+        bool changed=true;
+        while (k < max_k && num_left > 0 && changed) {
+            // DEADWOOD_PRINT("%d %d\n", k, max_k);
+            Py_ssize_t min_cluster_size = std::max(max_debris_size+1, Py_ssize_t(min_cluster_factor*n/(k+1)));
+
+            FLOAT min_weight_threshold=INFINITY;
+            for (Py_ssize_t i=0; i<k; ++i)
+                if (left[i] && weight_thresholds[i] < min_weight_threshold)
+                    min_weight_threshold = weight_thresholds[i];
+
+            changed=false;
+            for (Py_ssize_t e=m-1; e>=0; --e) {  // edges in decreasing order
+                if (mst_d[e] < min_weight_threshold) break;
+
+                if (skip_edges[e] || mst_cutsizes[2*e+0] < min_cluster_size
+                     || mst_cutsizes[2*e+1] < min_cluster_size) continue;
+
+                Py_ssize_t v = mst_i[2*e+0];
+                Py_ssize_t w = mst_i[2*e+1];
+                DEADWOOD_ASSERT(c[v] == c[w]);
+                if (!left[c[v]]) continue;
+
+                if (mst_d[e] < weight_thresholds[c[v]]) continue;
+
+                /* ok, so we now have a candidate edge;
+                will its removal, leading to the splitting of the cluster
+                containing vertex v, result in an increase in the number
+                of inliers? */
+                skip_edges[e] = true;
+                Py_ssize_t orig_k = k;
+                FLOAT orig_weight_threshold = weight_thresholds[c[v]];
+                FLOAT orig_contamination = contamination[c[v]];
+                Py_ssize_t changed_inliers;
+
+                num_left--;
+                left[c[v]] = false;
+
+                k = c[v];
+                mark_cluster(v);
+                changed_inliers = mark_inliers();
+                // DEADWOOD_PRINT("%d\n", changed_inliers);
+                if (changed_inliers > 0) {
+                    changed = true;
+                    num_left++;
+                    left[c[v]] = true;
+                }
+
+                k = orig_k;
+                mark_cluster(w);
+                changed_inliers = mark_inliers();
+                // DEADWOOD_PRINT("%d\n", changed_inliers);
+                if (changed_inliers > 0) {
+                    changed = true;
+                    num_left++;
+                    left[c[w]] = true;
+                }
+
+                // DEADWOOD_PRINT("%g %g %g\n", orig_weight_threshold, weight_thresholds[c[v]], weight_thresholds[c[w]]);
+
+                if (changed) {
+                    k = orig_k+1;
+                    break;
+                }
+
+                // undo
+                k = c[v];
+                skip_edges[e] = false;
+                mark_cluster(v);
+                k = orig_k;
+                weight_thresholds[c[v]] = orig_weight_threshold;
+                contamination[c[v]] = orig_contamination;
+            }
         }
 
         return k;
     }
 
-};
 
-
-/*! Labels connected components in a spanning forest (where skip_edges
- *  designate the edges omitted from the tree) and fetch their sizes
- *
- *  @param mst_i c_contiguous matrix of size m*2,
- *     where {mst_i[k,0], mst_i[k,1]} specifies the k-th (undirected) edge
- *     in the spanning tree
- *  @param m number of rows in mst_i (edges)
- *  @param n length of c and the number of vertices in the spanning tree
- *  @param c [out] array of length n, where
- *      c[i] denotes the cluster ID (in {0, 1, ..., k-1} for some k)
- *      of the i-th object, i=0,...,n-1
- *  @param max_k the actual size of s (a safeguard)
- *  @param s [out] array of length max_k >= k, where k is the number of connected
- *      components in the forest; s[i] gives the size of the i-th cluster;
- *      pass NULL to get only the cluster labels;
- *      obviously, k<=n; e.g., if m==n-1, then k=sum(skip_edges)+1
- *  @param mst_cumdeg an array of length n+1 or NULL; see Cgraph_vertex_incidences
- *  @param mst_inc an array of length 2*m or NULL; see Cgraph_vertex_incidences
- *  @param mst_skip Boolean array of length m or NULL; indicates the edges to skip
- */
-Py_ssize_t Cmst_cluster_sizes(
-    const Py_ssize_t* mst_i,
-    Py_ssize_t m,
-    Py_ssize_t n,
-    Py_ssize_t* c,
-    Py_ssize_t max_k=0,
-    Py_ssize_t* s=nullptr,
-    const Py_ssize_t* mst_cumdeg=nullptr,
-    const Py_ssize_t* mst_inc=nullptr,
-    const bool* mst_skip=nullptr
-) {
-    CMSTClusterSizeGetter get(mst_i, m, n, c, max_k, s, mst_cumdeg, mst_inc, mst_skip);
-    return get.process();  // modifies c in place
-}
-
-
-/* ************************************************************************** */
-
-
-
-
-/** See Cmst_impute_missing_labels below.
- */
-class CMSTMissingLabelsImputer : public CMSTProcessorBase
-{
-private:
-
-    void visit(Py_ssize_t v, Py_ssize_t e)
+    /*** -1 for outliers and cluster ID otherwise */
+    void get_outliers(Py_ssize_t* x)
     {
-        if (skip_edges && skip_edges[e]) return;
-
-        Py_ssize_t iv = (Py_ssize_t)(mst_i[2*e+1]==v);
-        Py_ssize_t w = mst_i[2*e+(1-iv)];
-
-        DEADWOOD_ASSERT(c[v] >= 0);
-        DEADWOOD_ASSERT(c[w] < 0);
-
-        c[w] = c[v];
-
-        for (const Py_ssize_t* pe = inc+cumdeg[w]; pe != inc+cumdeg[w+1]; pe++) {
-            if (*pe != e) visit(w, *pe);
-        }
+        for (Py_ssize_t v=0; v<n; ++v)
+            if (is_inlier[v]) x[v] = c[v];
+            else x[v] = -1;
     }
 
 
-public:
-    CMSTMissingLabelsImputer(
-        const Py_ssize_t* mst_i,
-        Py_ssize_t m,
-        Py_ssize_t n,
-        Py_ssize_t* c,
-        const Py_ssize_t* cumdeg=nullptr,
-        const Py_ssize_t* inc=nullptr,
-        const bool* skip_edges=nullptr
-    ) : CMSTProcessorBase(mst_i, m, n, c, cumdeg, inc, skip_edges)
+    void get_contamination(FLOAT* c)
     {
-        DEADWOOD_ASSERT(this->c);
-        DEADWOOD_ASSERT(this->cumdeg);
-        DEADWOOD_ASSERT(this->inc);
+        for (Py_ssize_t i=0; i<k; ++i)
+            c[i] = contamination[i];
     }
 
 
-    void process()
+    void get_mst_cut(Py_ssize_t* c)
     {
-        for (Py_ssize_t v=0; v<n; ++v) {
-            if (c[v] < 0) continue;
-
-            for (const Py_ssize_t* pe = inc+cumdeg[v]; pe != inc+cumdeg[v+1]; pe++) {
-                if (skip_edges && skip_edges[*pe]) continue;
-
-                Py_ssize_t iv = (Py_ssize_t)(mst_i[2*(*pe)+1]==v);
-                Py_ssize_t w = mst_i[2*(*pe)+(1-iv)];
-
-                if (c[w] < 0) {  // descend into this branch to impute missing values
-                    visit(v, *pe);
-                }
-            }
-        }
+        Py_ssize_t i=0;
+        for (Py_ssize_t e=0; e<m; ++e)
+            if (skip_edges[e]) c[i++] = e;
+        DEADWOOD_ASSERT(i == k-1);
     }
 
 };
-
-
-/*! Impute missing labels in all tree branches.
- *  All nodes in branches with class ID of -1 will be assigned their parent node's class.
- *
- *  @param mst_i c_contiguous matrix of size m*2,
- *     where {mst_i[k,0], mst_i[k,1]} specifies the k-th (undirected) edge
- *     in the spanning tree
- *  @param m number of rows in mst_i (edges)
- *  @param n length of c and the number of vertices in the spanning tree
- *  @param c [in/out] c_contiguous vector of length n, where
- *      c[i] denotes the cluster ID (in {-1, 0, 1, ..., k-1} for some k)
- *      of the i-th object, i=0,...,n-1.  Class -1 represents missing values
- *      to be imputed
- *  @param mst_cumdeg an array of length n+1 or NULL; see Cgraph_vertex_incidences
- *  @param mst_inc an array of length 2*m or NULL; see Cgraph_vertex_incidences
- *  @param mst_skip Boolean array of length m or NULL; indicates the edges to skip
- */
-void Cmst_label_imputer(
-    const Py_ssize_t* mst_i,
-    Py_ssize_t m,
-    Py_ssize_t n,
-    Py_ssize_t* c,
-    const Py_ssize_t* mst_cumdeg=nullptr,
-    const Py_ssize_t* mst_inc=nullptr,
-    const bool* mst_skip=nullptr
-) {
-    CMSTMissingLabelsImputer imp(mst_i, m, n, c, mst_cumdeg, mst_inc, mst_skip);
-    imp.process();  // modifies c in place
-}
-
-
-/* ************************************************************************** */
-
-
-
-template<class FLOAT>
-void Cget_contamination(
-    const FLOAT* mst_d,
-    Py_ssize_t m,
-    FLOAT max_contamination,
-    FLOAT ema_dt,
-    FLOAT& contamination,
-    Py_ssize_t& threshold_index
-) {
-    if (max_contamination <= 0.0) {
-        contamination = -max_contamination;
-        threshold_index =  int(m*(1.0-contamination));
-    }
-    else {
-        Py_ssize_t shift = (int)(m*(1.0-max_contamination));
-        Py_ssize_t elbow_index = Ckneedle_increasing(mst_d+shift, m-shift, true, ema_dt);
-        if (elbow_index == 0) {
-            threshold_index = m;
-            contamination = 0.0;
-        }
-        else {
-            threshold_index = shift+elbow_index+1;
-            contamination = (m-threshold_index)/(FLOAT)(m+1);
-        }
-    }
-}
 
 
 /*! The Deadwood outlier detection algorithm
  *
  *  @param mst_d size m - edge weights
  *  @param mst_i c_contiguous matrix of size m*2,
- *     where {mst_i[k,0], mst_i[k,1]} specifies the k-th (undirected) edge
+ *     where {mst_i[i,0], mst_i[i,1]} specifies the i-th (undirected) edge
  *     in the spanning tree
- *  @param mst_cut array of size k-1; indexes of cut edges defining a spanning
- *     forest with k connected components
+ *  @param mst_cut [in/out] array of size max_k-1; indexes of cut edges
+ *     defining a spanning forest with k connected components;
+ *     the first k-1 indexes define the initial partition
  *  @param m number of rows in mst_i (edges)
  *  @param n length of c and the number of vertices in the spanning tree
  *  @param k number of initial clusters
- *  @param c [out] array of length n, c[i]==1 marks an outlier
+ *  @param max_k maximal number of clusters to identify
+ *  @param is_outlier [out] array of length n, c[i]==1 marks an outlier
  *         and c[i]==0 denotes an inlier
+ *  @param min_cluster_factor in the k-th iteration, clusters will not be
+ *         smaller than min_cluster_factor*n/(k+1)
  *  @param max_debris_size connected components of size <= max_debris_size will
  *         be treated as outliers
  *  @param max_contamination maximal contamination level;
- *         negative values will be used as actual contamination levels
+ *         negative values will be used as requested contamination levels
  *  @param ema_dt controls the exponential moving average smoothing parameter
  *         alpha = 1-exp(-dt) (in elbow detection)
- *  @param contamination [out] array of length k;
+ *  @param contamination [out] array of length max_k;
  *         detected contamination levels in each cluster
  *  @param mst_cumdeg an array of length n+1 or NULL; see Cgraph_vertex_incidences
  *  @param mst_inc an array of length 2*m or NULL; see Cgraph_vertex_incidences
+ *
+ *  @return number of detected clusters
  */
 template <class FLOAT>
-void Cdeadwood(
+Py_ssize_t Cdeadwood(
     const FLOAT* mst_d,  // size m [in]
     const Py_ssize_t* mst_i,  // size m [in]
-    const Py_ssize_t* mst_cut,  // size k-1 [in]
     Py_ssize_t m,
     Py_ssize_t n,
-    Py_ssize_t k,
     FLOAT max_contamination,
     FLOAT ema_dt,
     Py_ssize_t max_debris_size,
-    FLOAT* contamination,  // size k [out]
-    Py_ssize_t* c,  // size n [out]
+    Py_ssize_t k,
+    Py_ssize_t max_k,
+    FLOAT min_cluster_factor,
+    // FLOAT inlier_threshold,
+    Py_ssize_t* mst_cut,  // size max_k-1 [in/out]
+    FLOAT* contamination,  // size max_k [out]
+    Py_ssize_t* is_outlier,  // size n [out]
     const Py_ssize_t* mst_cumdeg=nullptr,
     const Py_ssize_t* mst_inc=nullptr
 ) {
-    DEADWOOD_ASSERT(k >= 1 && k <= n);
+    DEADWOOD_ASSERT(k >= 1);
+    DEADWOOD_ASSERT(k <= max_k);
+    DEADWOOD_ASSERT(max_k < n);
     DEADWOOD_ASSERT(m == n-1);
     DEADWOOD_ASSERT(n > 1);
-
-    cvector<Py_ssize_t> sizes(n);  // upper bound for the number of clusters
-    cvector<bool> mst_skip(m, false);  // std::vector<bool> has no data()
-
-    CMSTClusterSizeGetter size_getter(mst_i, m, n, c, n, sizes.data(), mst_cumdeg, mst_inc, mst_skip.data());
-
     DEADWOOD_ASSERT(max_contamination >= -1.0 && max_contamination <= 1.0);
 
-    if (k == 1) {
-        Py_ssize_t threshold_index = -1;
-        Cget_contamination(
-            mst_d, m, max_contamination, ema_dt,
-            /*out*/contamination[0], /*out*/threshold_index
-        );
+    CDeadwood<FLOAT> dw(
+        mst_d, mst_i, m, n, max_contamination, ema_dt, max_debris_size,
+        k, max_k, min_cluster_factor, //inlier_threshold,
+        mst_cut, mst_cumdeg, mst_inc
+    );
 
-        // DEADWOOD_PRINT("%d-%d\n", threshold_index, m);
-        DEADWOOD_ASSERT(threshold_index >= 0);
-        for (Py_ssize_t i=threshold_index; i<m; ++i)
-            mst_skip[i] = true;
-    }
-    else {
-        for (Py_ssize_t i=0; i<k-1; ++i) {
-            DEADWOOD_ASSERT(mst_cut[i] >= 0 && mst_cut[i] < m);
-            DEADWOOD_ASSERT(!mst_skip[mst_cut[i]]);
-            mst_skip[mst_cut[i]] = true;
-        }
+    Py_ssize_t _k = dw.process();
 
-        Py_ssize_t _k = size_getter.process();  // sets c and sizes based on the current mst_skip
-        DEADWOOD_ASSERT(_k == k);
+    dw.get_outliers(is_outlier);
+    dw.get_contamination(contamination);
+    if (_k != k) dw.get_mst_cut(mst_cut);
 
-        cvector<Py_ssize_t> edge_labels(m);
-        for (Py_ssize_t i=0; i<m; ++i) {
-            if (c[mst_i[2*i+0]]>=0 && c[mst_i[2*i+0]] == c[mst_i[2*i+1]])
-                edge_labels[i] = c[mst_i[2*i+0]];
-            else
-                edge_labels[i] = -1;
-        }
-
-        cvector<FLOAT> mst_d_grp(n);
-        cvector<Py_ssize_t> ind_grp(k+1);
-        Csort_groups(mst_d, m, edge_labels.data(), k, mst_d_grp.data(), ind_grp.data());
-
-        cvector<FLOAT> weight_thresholds(k);
-        for (Py_ssize_t i=0; i<k; ++i) {
-            Py_ssize_t mi = sizes[i]-1;
-            Py_ssize_t threshold_index;
-            Cget_contamination(
-                mst_d_grp.data()+ind_grp[i], mi, max_contamination, ema_dt,
-                /*out*/contamination[i], /*out*/threshold_index
-            );
-            DEADWOOD_ASSERT(threshold_index>=0);
-            if (threshold_index < mi)
-                weight_thresholds[i] = mst_d_grp[ind_grp[i]+threshold_index];
-            else
-                weight_thresholds[i] = INFINITY;
-        }
-
-        for (Py_ssize_t i=0; i<m; ++i) {
-            if (edge_labels[i] >= 0 && mst_d[i] >= weight_thresholds[edge_labels[i]])
-                mst_skip[i] = true;
-        }
-    }
-
-
-    size_getter.process();  // sets c and sizes based on the current mst_skip
-    // DEADWOOD_PRINT("%d\n", _k);
-
-    for (Py_ssize_t i=0; i<n; ++i) {
-        DEADWOOD_ASSERT(c[i] >= 0 && c[i] < n);
-        DEADWOOD_ASSERT(sizes[c[i]] > 0);
-        if (sizes[c[i]] <= max_debris_size)
-            c[i] = 1;
-        else
-            c[i] = 0;
-    }
+    return _k;
 }
 
 
-#if 0  /* /remove deprecated Cmst_trim_branches */
+/* ************************************************************************** */
 
-/** See Cmst_trim_branches below.  [DEPRECATED]
+
+#if 0
+/** Deadwood, connected=true
  */
 template <class FLOAT> class CMSTBranchTrimmer : public CMSTProcessorBase
 {
+public:
+    std::unique_ptr<FLOAT[]> mst_d;
+
 private:
-    const FLOAT* mst_d;
-    const FLOAT min_d;
     const Py_ssize_t max_size;
 
-
-    std::vector<Py_ssize_t> size;
-
-    Py_ssize_t clk;   // the number of connected components
-    std::vector<Py_ssize_t> clsize;
+    std::unique_ptr<Py_ssize_t[]> size;  // size (m,2)
 
 
     Py_ssize_t visit_get_sizes(Py_ssize_t v, Py_ssize_t e)
     {
         if (skip_edges && skip_edges[e]) return 0;
-
         Py_ssize_t iv = (Py_ssize_t)(mst_i[2*e+1]==v);
         Py_ssize_t w = mst_i[2*e+(1-iv)];
 
@@ -831,9 +476,9 @@ private:
         Py_ssize_t iv = (Py_ssize_t)(mst_i[2*e+1]==v);
         Py_ssize_t w = mst_i[2*e+(1-iv)];
 
-        if (c[w] < 0) return;  // already visited
+        if (c[w] > 0) return;  // already visited
 
-        c[w] = -1;
+        c[w] = 1;
 
         for (const Py_ssize_t* pe = inc+cumdeg[w]; pe != inc+cumdeg[w+1]; pe++) {
             if (*pe != e) visit_mark(w, *pe);
@@ -841,82 +486,98 @@ private:
     }
 
 
+    void visit_update_mst_d(Py_ssize_t v, Py_ssize_t e, FLOAT max_d)
+    {
+        if (skip_edges && skip_edges[e]) return;
+
+        Py_ssize_t iv = (Py_ssize_t)(mst_i[2*e+1]==v);
+        Py_ssize_t w = mst_i[2*e+(1-iv)];
+
+        if (size[2*e + (1-iv)] > max_size) {
+            // no change to mst_d
+            max_d = mst_d[e];
+        }
+        else {
+            if (max_d < mst_d[e]) max_d = mst_d[e];
+            else mst_d[e] = max_d;
+        }
+
+        for (const Py_ssize_t* pe = inc+cumdeg[w]; pe != inc+cumdeg[w+1]; pe++) {
+            if (*pe != e) visit_update_mst_d(w, *pe, max_d);
+        }
+    }
+
+
 public:
     CMSTBranchTrimmer(
-        const FLOAT* mst_d,
-        FLOAT min_d,
-        Py_ssize_t max_size,
+        const FLOAT* orig_mst_d,
         const Py_ssize_t* mst_i,
         Py_ssize_t m,
         Py_ssize_t n,
         Py_ssize_t* c,
+        Py_ssize_t max_size,
         const Py_ssize_t* cumdeg=nullptr,
-        const Py_ssize_t* inc=nullptr,
-        const bool* skip_edges=nullptr
+        const Py_ssize_t* inc=nullptr
     ) :
-        CMSTProcessorBase(mst_i, m, n, c, cumdeg, inc, skip_edges),
-        mst_d(mst_d), min_d(min_d), max_size(max_size),
-        size(2*m, -1)
+        CMSTProcessorBase(mst_i, m, n, c, cumdeg, inc),
+        max_size(max_size)
     {
         DEADWOOD_ASSERT(this->c);
         DEADWOOD_ASSERT(this->cumdeg);
         DEADWOOD_ASSERT(this->inc);
-
         DEADWOOD_ASSERT(m == n-1);
 
-        // the number of connected components:
-        clk = 1;
-        if (skip_edges) {
-            for (Py_ssize_t e = 0; e < m; ++e)
-                if (skip_edges[e]) clk++;
+        mst_d.reset(new FLOAT[m]);
+        for (Py_ssize_t i=0; i<m; ++i) mst_d[i] = orig_mst_d[i];
+
+        size.reset(new Py_ssize_t[2*m]);
+        for (Py_ssize_t i=0; i<2*m; ++i) size[i] = -1;
+
+        for (Py_ssize_t v=0; v<n; ++v) c[v] = -1;
+
+        Py_ssize_t v = 0;  // any vertex
+        c[v] = 0;
+        for (const Py_ssize_t* pe = inc+cumdeg[v]; pe != inc+cumdeg[v+1]; pe++) {
+            visit_get_sizes(v, *pe);
         }
-        clsize.resize(clk);
+
+        for (Py_ssize_t e=0; e<m; ++e) {
+            DEADWOOD_ASSERT(size[2*e+0] > 0 || size[2*e+1] > 0);
+            if (size[2*e+0] > 0)
+                size[2*e+1] = n - size[2*e+0];
+            else
+                size[2*e+0] = n - size[2*e+1];
+        }
     }
 
 
-    void process()
+    void update_mst_d()
     {
-        for (Py_ssize_t v=0; v<n; ++v) c[v] = -1;
-        for (Py_ssize_t i=0; i<clk; ++i) clsize[i] = 0;
+        // this makes mst_d not sorted
 
-        Py_ssize_t lastc = 0;
-        for (Py_ssize_t v=0; v<n; ++v) {
-            if (c[v] >= 0) continue;
-
-            c[v] = lastc;
-            Py_ssize_t this_size = 1;
-
-            for (const Py_ssize_t* pe = inc+cumdeg[v]; pe != inc+cumdeg[v+1]; pe++) {
-                if (skip_edges && skip_edges[*pe]) continue;
-                this_size += visit_get_sizes(v, *pe);
-            }
-            clsize[lastc] = this_size;
-
-            lastc++;
-            if (lastc == clk) break;
+        Py_ssize_t e;
+        for (e=0; e<m; ++e) {
+            if (size[2*e+0] > max_size && size[2*e+1] > max_size)
+                break;
         }
+        DEADWOOD_ASSERT(e<m);
 
-        DEADWOOD_ASSERT(lastc == clk);
-        DEADWOOD_ASSERT(clk > 1 || clsize[0] == n);
-
-        for (Py_ssize_t e=0; e<m; ++e) {
-            if (skip_edges && skip_edges[e]) continue;
-            DEADWOOD_ASSERT(size[2*e+0] > 0 || size[2*e+1] > 0);
-            DEADWOOD_ASSERT(clsize[c[mst_i[2*e+0]]] == clsize[c[mst_i[2*e+1]]]);
-            if (size[2*e+0] > 0)
-                size[2*e+1] = clsize[c[mst_i[2*e+0]]] - size[2*e+0];
-            else
-                size[2*e+0] = clsize[c[mst_i[2*e+1]]] - size[2*e+1];
+        // e will not be trimmed out
+        Py_ssize_t v = mst_i[2*e+0];
+        for (const Py_ssize_t* pe = inc+cumdeg[v]; pe != inc+cumdeg[v+1]; pe++) {
+            visit_update_mst_d(v, *pe, mst_d[*pe]);
         }
+    }
 
 
+    void trim(FLOAT trim_d)
+    {
         for (Py_ssize_t e=0; e<m; ++e) {
-            if (skip_edges && skip_edges[e]) continue;
-            if (mst_d[e] <= min_d) continue;
+            if (mst_d[e] < trim_d) continue;
 
             Py_ssize_t iv = (size[2*e+0]>=size[2*e+1])?0:1;
             Py_ssize_t v = mst_i[2*e+iv];
-            if (c[v] < 0) continue;
+            if (c[v] > 0) continue;
             if (size[2*e+(1-iv)] > max_size) continue;
             visit_mark(v, e);
         }
@@ -925,45 +586,53 @@ public:
 };
 
 
-/*! Trim tree branches of size <= max_size connected by an edge > min_d  [DEPRECATED]
- *
- *
- *  @param mst_d m edge weights
- *  @param mst_i c_contiguous matrix of size m*2,
- *     where {mst_i[k,0], mst_i[k,1]} specifies the k-th (undirected) edge
- *     in the spanning tree
- *  @param m number of rows in mst_i (edges)
- *  @param c [out] vector of length n; c[i] == -1 marks a trimmed-out point,
- *     whereas c[i] >= 0 denotes a retained one
- *  @param n length of c and the number of vertices in the spanning tree, n == m+1
- *  @param min_d minimal edge weight to be considered trimmable
- *  @param max_size maximal allowable size of a branch to cut
- *  @param mst_cumdeg an array of length n+1 or NULL; see Cgraph_vertex_incidences
- *  @param mst_inc an array of length 2*m or NULL; see Cgraph_vertex_incidences
- *  @param mst_skip Boolean array of length m or NULL; indicates the edges to skip
- */
 template <class FLOAT>
-void Cmst_trim_branches(
-    const FLOAT* mst_d,
-    FLOAT min_d,
-    Py_ssize_t max_size,
-    const Py_ssize_t* mst_i,
+void Cdeadwood_connected(
+    const FLOAT* mst_d,  // size m [in]
+    const Py_ssize_t* mst_i,  // size m [in]
+    const Py_ssize_t* mst_cut,  // size k-1 [in]
     Py_ssize_t m,
     Py_ssize_t n,
-    Py_ssize_t* c,
+    Py_ssize_t k,
+    FLOAT max_contamination,
+    FLOAT ema_dt,
+    Py_ssize_t max_debris_size,
+    FLOAT* contamination,  // size k [out]
+    Py_ssize_t* c,  // size n [out]
     const Py_ssize_t* mst_cumdeg=nullptr,
-    const Py_ssize_t* mst_inc=nullptr,
-    const bool* mst_skip=nullptr
+    const Py_ssize_t* mst_inc=nullptr
 ) {
-    CMSTBranchTrimmer tr(mst_d, min_d, max_size, mst_i, m, n, c, cumdeg, inc, skip_edges);
-    tr.process();  // modifies c in place
+    DEADWOOD_ASSERT(k >= 1 && k <= n);
+    DEADWOOD_ASSERT(m == n-1);
+    DEADWOOD_ASSERT(n > 1);
+    DEADWOOD_ASSERT(max_contamination >= -1.0 && max_contamination <= 1.0);
+
+    DEADWOOD_ASSERT(k == 1);
+
+    CMSTBranchTrimmer tr(
+        mst_d, mst_i, m, n, c, max_debris_size, mst_cumdeg, mst_inc
+    );
+
+    // tr.update_mst_d();
+
+    std::unique_ptr<FLOAT[]> mst_d2(new FLOAT[m]);
+    for (Py_ssize_t i=0; i<m; ++i) mst_d2[i] = tr.mst_d[i];
+
+    std::sort(mst_d2.get(), mst_d2.get()+m);
+
+    Py_ssize_t threshold_index = -1;
+    Cget_contamination(
+        mst_d2.get(), m, max_contamination, ema_dt,
+        /*out*/contamination[0], /*out*/threshold_index
+    );
+
+    FLOAT trim_d = (threshold_index+1 < m)?mst_d2[threshold_index+1]:INFINITY;
+
+    tr.trim(trim_d);  // modifies c in place
+
+    return;
 }
-
-
-#endif  /* /remove deprecated Cmst_trim_branches */
-
-
-/* ************************************************************************** */
+#endif
 
 
 #endif

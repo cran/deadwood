@@ -16,8 +16,8 @@
 
 #include "c_common.h"
 #include "c_kneedle.h"
+#include "c_auxiliary.h"
 #include "c_deadwood.h"
-#include <cmath>
 
 using namespace Rcpp;
 
@@ -32,28 +32,27 @@ using namespace Rcpp;
 // TODO: mst_label_imputer
 
 
-
 //' @title Knee/Elbow Point Detection
 //'
 //' @description
 //' Finds the most significant knee/elbow using the Kneedle algorithm
 //' with exponential smoothing.
 //'
-//' @param x data vector (increasing)
+//' @param x data vector (increasing) of length \code{n}
 //'
 //' @param convex whether the data in \code{x} are convex-ish (elbow detection)
 //'         or not (knee lookup)
 //'
 //' @param dt controls the smoothing parameter \eqn{\alpha = 1-\exp(-dt)}
 //'         of the exponential moving average,
-//'         \eqn{y_i = \alpha x_i + (1-\alpha) x_{i-1}}, \eqn{y_1 = x_1}
+//'         \eqn{y_i = \alpha x_i + (1-\alpha) y_{i-1}}, \eqn{y_1 = x_1}
 //'
 //'
 //' @return
-//' Returns the index of the knee/elbow point; 1 if not found.
+//' Returns the index of the knee/elbow point or \code{n} if not found.
 //'
 //' @references
-//' V. Satopaa, J. Albrecht, D. Irwin, B. Raghavan,
+//' V. Satopää, J. Albrecht, D. Irwin, B. Raghavan,
 //' Finding a "Kneedle" in a haystack: Detecting knee points in system behavior,
 //' In: 31st Intl. Conf. Distributed Computing Systems Workshops,
 //' 2011, 166-171, \doi{10.1109/ICDCSW.2011.20}
@@ -73,6 +72,8 @@ double kneedle_increasing(NumericVector x, bool convex=true, double dt=0.01)
 LogicalVector dot_deadwood(
     NumericMatrix mst,
     NumericVector cut_edges,
+    int max_k,
+    double min_cluster_factor,
     double max_contamination,
     double ema_dt,
     int max_debris_size,
@@ -91,34 +92,39 @@ LogicalVector dot_deadwood(
         mst_d[i] = mst(i, 2);
     }
 
-
     Py_ssize_t k = cut_edges.size()+1;
+    if (max_k < k) max_k = k;
 
-    std::vector<Py_ssize_t> mst_cut(k-1);
+    std::vector<Py_ssize_t> is_outlier(n);
+    std::vector<double> contamination(max_k);
+    std::vector<Py_ssize_t> mst_cut(max_k-1);
     for (Py_ssize_t i=0; i<k-1; ++i) {
         mst_cut[i] = (Py_ssize_t)cut_edges[i]-1;
         DEADWOOD_ASSERT(mst_cut[i] >= 0 && mst_cut[i] < n-1);
     }
 
-    std::vector<double> contamination(k);
-    std::vector<Py_ssize_t> is_outlier(n);
-    Cdeadwood(
-        mst_d.data(), mst_i.data(), mst_cut.data(), n-1, n, k,
+    Py_ssize_t _k = Cdeadwood(
+        mst_d.data(), mst_i.data(), n-1, n,
         max_contamination, ema_dt, max_debris_size,
-        contamination.data(), is_outlier.data(), NULL, NULL
+        k, max_k, min_cluster_factor, //inlier_threshold,
+        mst_cut.data(), contamination.data(), is_outlier.data(), NULL, NULL
     );
 
     LogicalVector res(n);
     for (Py_ssize_t i=0; i<n; ++i) {
-        if (is_outlier[i]) res[i] = TRUE;
+        if (is_outlier[i]<0) res[i] = TRUE;
         else res[i] = FALSE;
     }
 
-    NumericVector contaminationr(k);
-    for (Py_ssize_t i=0; i<k; ++i)
+    NumericVector contaminationr(_k);
+    for (Py_ssize_t i=0; i<_k; ++i)
         contaminationr[i] = contamination[i];
-
     res.attr("contamination") = contaminationr;
+
+    NumericVector cut_edgesr(_k-1);
+    for (Py_ssize_t i=0; i<_k-1; ++i)
+        cut_edgesr[i] = mst_cut[i]+1;
+    res.attr("cut_edges") = cut_edgesr;
 
     if (verbose) DEADWOOD_PRINT("[deadwood] Done.\n");
 

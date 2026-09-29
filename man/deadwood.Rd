@@ -6,13 +6,15 @@
 \alias{deadwood.dist}
 \alias{deadwood.mstclust}
 \alias{deadwood.mst}
-\title{Deadwood: Outlier Detection via Trimming of Mutual Reachability Minimum Spanning Trees}
+\title{Deadwood: Outlier Detection via Pruning Mutual Reachability Minimum Spanning Trees}
 \usage{
 deadwood(d, ...)
 
 \method{deadwood}{default}(
   d,
-  M = 5L,
+  M = 10L,
+  min_cluster_factor = 0.15,
+  max_k = NA_integer_,
   contamination = NA_real_,
   max_debris_size = NA_real_,
   max_contamination = 0.5,
@@ -24,7 +26,9 @@ deadwood(d, ...)
 
 \method{deadwood}{dist}(
   d,
-  M = 5L,
+  M = 10L,
+  min_cluster_factor = 0.15,
+  max_k = NA_integer_,
   contamination = NA_real_,
   max_debris_size = NA_real_,
   max_contamination = 0.5,
@@ -35,6 +39,8 @@ deadwood(d, ...)
 
 \method{deadwood}{mstclust}(
   d,
+  min_cluster_factor = 0.15,
+  max_k = NA_integer_,
   contamination = NA_real_,
   max_debris_size = NA_real_,
   max_contamination = 0.5,
@@ -45,6 +51,8 @@ deadwood(d, ...)
 
 \method{deadwood}{mst}(
   d,
+  min_cluster_factor = 0.15,
+  max_k = NA_integer_,
   contamination = NA_real_,
   max_debris_size = NA_real_,
   max_contamination = 0.5,
@@ -68,6 +76,15 @@ or an object of class \code{mst} (see \code{\link{mst}})}
 otherwise, the mutual reachability distance based on the \eqn{M}-th
 nearest neighbours is used}
 
+\item{min_cluster_factor}{in the \code{k}-th iteration of the cluster
+refinement stage, clusters will not be smaller than
+\code{min_cluster_factor*n/(k+1)}, which is similar to what happens
+in the Lumbermark clustering algorithm}
+
+\item{max_k}{maximal number of clusters to detect; by default (\code{NA}),
+at most 10 clusters are requested unless \code{cut_edges} is given,
+in which case there will be no further cluster refinement}
+
 \item{contamination}{single numeric value or \code{NA};
 the estimated (approximate) proportion of outliers in the dataset;
 if \code{NA}, the contamination amount will be determined
@@ -85,7 +102,7 @@ maximal contamination level assumed when \code{contamination} is \code{NA}}
 \item{ema_dt}{single numeric value;
 controls the smoothing parameter \eqn{\alpha = 1-\exp(-dt)}
 of the exponential moving average (in edge length elbow point detection),
-\eqn{y_i = \alpha w_i + (1-\alpha) w_{i-1}}, \eqn{y_1 = d_1}}
+\eqn{y_i = \alpha w_i + (1-\alpha) y_{i-1}}, \eqn{y_1 = d_1}}
 
 \item{distance}{metric used in the case where \code{d} is a matrix; one of:
 \code{"euclidean"} (synonym: \code{"l2"}),
@@ -99,7 +116,7 @@ and progress information}
 \eqn{k-1} indexes of the tree edges whose omission lead to
 \eqn{k} connected components (clusters), where the outliers are to
 be sought independently; most frequently this is generated
-via \pkg{genieclust} or \pkg{lumbermark}.}
+via \pkg{genieclust} or \pkg{lumbermark}}
 }
 \value{
 A logical vector \code{y} of length \eqn{n}, where \code{y[i] == TRUE}
@@ -114,15 +131,17 @@ in each cluster (which can be different from the observed proportion
 of outliers detected).
 }
 \description{
-Deadwood is an anomaly detection algorithm based on Mutual Reachability
-Minimum Spanning Trees.  It trims protruding tree segments and marks small
-debris as outliers.
+Deadwood is an anomaly detection algorithm based on a dataset's mutual
+reachability minimum spanning tree.  It prunes protruding tree segments
+and marks small debris as outliers.
 
-More precisely, the use of a mutual reachability distance
-pulls peripheral points farther away from each other.
-Tree edges with weights beyond the detected elbow point
-are removed. All the resulting connected components whose
-sizes are smaller than a given threshold are deemed anomalous.
+More precisely, tree edges with weights greater than the detected elbow
+point are removed.  All the resulting connected components whose sizes do
+not exceed a prespecified threshold are deemed anomalous.  The use of
+a mutual reachability distance pulls peripheral observations farther away
+from one another.  If the dataset is comprised of well-separated clusters
+of heterogeneous densities, an attempt to split the dataset and refine
+the outlierness markers will be made.
 }
 \details{
 As with all distance-based methods (this includes k-means and DBSCAN as well),
@@ -137,9 +156,11 @@ for low-dimensional Euclidean spaces, a faster algorithm based on K-d trees
 is selected automatically; see \code{\link[quitefastmst]{mst_euclid}} from
 the \pkg{quitefastmst} package.
 
-Once the spanning tree is determined (\eqn{\Omega(n \log n)}-\eqn{O(n^2)}),
-the Deadwood algorithm runs in \eqn{O(n)} time.
-Memory use is also \eqn{O(n)}.
+Once the spanning tree with increasingly sorted edge weights
+is determined (\eqn{\Omega(n \log n)}-\eqn{O(n^2)}),
+the Deadwood algorithm runs in \eqn{O(k n \log n)} time,
+where \eqn{k} is the number of detected subclusters.
+Memory use is \eqn{O(n)}.
 }
 \examples{
 library("datasets")
@@ -151,9 +172,13 @@ plot(X, col=c("#ff000066", "#55555555")[is_outlier+1],
 
 }
 \references{
-M. Gagolewski, deadwood, in preparation, 2026, TODO
+M. Gagolewski, Deadwood, in preparation, 2026, TODO
 
-V. Satopaa, J. Albrecht, D. Irwin, B. Raghavan, Finding a "Kneedle"
+M. Gagolewski, Lumbermark: Resistant clustering by chopping up mutual
+reachability minimum spanning trees*, preprint, 2026,
+\doi{10.48550/arXiv.2604.07143}
+
+V. Satopää, J. Albrecht, D. Irwin, B. Raghavan, Finding a "Kneedle"
 in a haystack: Detecting knee points in system behavior,
 In: 31st Intl. Conf. Distributed Computing Systems Workshops,
 2011, 166-171, \doi{10.1109/ICDCSW.2011.20}

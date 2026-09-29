@@ -7,21 +7,21 @@
 #' Finds the most significant knee/elbow using the Kneedle algorithm
 #' with exponential smoothing.
 #'
-#' @param x data vector (increasing)
+#' @param x data vector (increasing) of length \code{n}
 #'
 #' @param convex whether the data in \code{x} are convex-ish (elbow detection)
 #'         or not (knee lookup)
 #'
 #' @param dt controls the smoothing parameter \eqn{\alpha = 1-\exp(-dt)}
 #'         of the exponential moving average,
-#'         \eqn{y_i = \alpha x_i + (1-\alpha) x_{i-1}}, \eqn{y_1 = x_1}
+#'         \eqn{y_i = \alpha x_i + (1-\alpha) y_{i-1}}, \eqn{y_1 = x_1}
 #'
 #'
 #' @return
-#' Returns the index of the knee/elbow point; 1 if not found.
+#' Returns the index of the knee/elbow point or \code{n} if not found.
 #'
 #' @references
-#' V. Satopaa, J. Albrecht, D. Irwin, B. Raghavan,
+#' V. Satopää, J. Albrecht, D. Irwin, B. Raghavan,
 #' Finding a "Kneedle" in a haystack: Detecting knee points in system behavior,
 #' In: 31st Intl. Conf. Distributed Computing Systems Workshops,
 #' 2011, 166-171, \doi{10.1109/ICDCSW.2011.20}
@@ -33,8 +33,8 @@ kneedle_increasing <- function(x, convex = TRUE, dt = 0.01) {
     .Call(`_deadwood_kneedle_increasing`, x, convex, dt)
 }
 
-.deadwood <- function(mst, cut_edges, max_contamination, ema_dt, max_debris_size, verbose) {
-    .Call(`_deadwood_dot_deadwood`, mst, cut_edges, max_contamination, ema_dt, max_debris_size, verbose)
+.deadwood <- function(mst, cut_edges, max_k, min_cluster_factor, max_contamination, ema_dt, max_debris_size, verbose) {
+    .Call(`_deadwood_dot_deadwood`, mst, cut_edges, max_k, min_cluster_factor, max_contamination, ema_dt, max_debris_size, verbose)
 }
 
 .oldmst.matrix <- function(X, distance = "euclidean", M = 0L, cast_float32 = FALSE, verbose = FALSE) {

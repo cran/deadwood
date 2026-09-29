@@ -1,9 +1,9 @@
 Package: deadwood
 Type: Package
-Title: Outlier Detection via Trimming of Mutual Reachability Minimum
+Title: Outlier Detection via Pruning Mutual Reachability Minimum
         Spanning Trees
-Version: 0.9.0-3
-Date: 2026-02-20
+Version: 0.9.1
+Date: 2026-09-29
 Authors@R: 
     person("Marek", "Gagolewski",
         role = c("aut", "cre", "cph"),
@@ -11,15 +11,17 @@ Authors@R:
         comment = c(ORCID = "0000-0003-0637-6028")
     )
 Description: 
-    Implements an anomaly detection algorithm based on
-    mutual reachability minimum spanning trees: 'deadwood' trims
+    Implements an anomaly detection algorithm based on a dataset's
+    mutual reachability minimum spanning tree: 'deadwood' prunes
     protruding tree segments and marks small debris as outliers;
     see Gagolewski (2026) <https://deadwood.gagolewski.com/>.
-    More precisely, the use of a mutual reachability distance pulls
-    peripheral points farther away from each other.  Tree edges
-    with weights beyond the detected elbow point are removed.
-    All the resulting connected components whose sizes are smaller
-    than a given threshold are deemed anomalous.
+    More precisely, tree edges with weights greater than the detected elbow
+    point are removed.  All the resulting connected components whose sizes do
+    not exceed a prespecified threshold are deemed anomalous.  The use of
+    a mutual reachability distance pulls peripheral observations farther away
+    from one another.  If the dataset is comprised of well-separated clusters
+    of heterogeneous densities, an attempt to split the dataset and refine
+    the outlierness markers will be made.
     The 'Python' version of 'deadwood' is available via 'PyPI'.
 BugReports: https://github.com/gagolews/deadwood/issues
 URL: https://deadwood.gagolewski.com/,
@@ -30,11 +32,11 @@ Suggests: datasets,
 LinkingTo: Rcpp
 Encoding: UTF-8
 SystemRequirements: OpenMP
-RoxygenNote: 7.3.3
+Config/roxygen2/version: 8.1.0
 NeedsCompilation: yes
-Packaged: 2026-02-20 19:29:02 UTC; gagolews
+Packaged: 2026-09-29 11:21:04 UTC; gagolews
 Author: Marek Gagolewski [aut, cre, cph] (ORCID:
     <https://orcid.org/0000-0003-0637-6028>)
 Maintainer: Marek Gagolewski <marek@gagolewski.com>
 Repository: CRAN
-Date/Publication: 2026-02-21 23:30:02 UTC
+Date/Publication: 2026-09-29 14:10:15 UTC
